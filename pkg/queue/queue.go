@@ -125,6 +125,22 @@ func (q *RequestQueue) Enqueue(tenant string, path []string, req Request, maxQue
 	}
 }
 
+func (q *RequestQueue) DequeueMany(ctx context.Context, last QueueIndex, consumerID string, maxItems int, maxWait time.Duration) ([]Request, QueueIndex, error) {
+	// create a context for dequeuing with a max time we want to wait to fullfill the desired maxItems
+	ctx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+
+	var err error
+	var idx QueueIndex
+	items := make([]Request, 0, maxItems)
+	for err == nil && len(items) < maxItems {
+		var item Request
+		item, idx, err = q.Dequeue(ctx, last, consumerID)
+		items = append(items, item)
+	}
+	return items, idx, err
+}
+
 // Dequeue find next tenant queue and takes the next request off of it. Will block if there are no requests.
 // By passing tenant index from previous call of this method, querier guarantees that it iterates over all tenants fairly.
 // If consumer finds that request from the tenant is already expired, it can get a request for the same tenant by using UserIndex.ReuseLastUser.

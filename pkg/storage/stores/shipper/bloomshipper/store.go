@@ -23,6 +23,7 @@ type Interface interface {
 
 type Store interface {
 	FilterChunkRefs(ctx context.Context, tenant string, from, through time.Time, chunkRefs []*logproto.GroupedChunkRefs, filters ...*logproto.LineFilterExpression) ([]*logproto.GroupedChunkRefs, error)
+	Filter(ctx context.Context, tenant string, fp uint64, from, through time.Time, chunks []*logproto.ShortRef, filters ...*logproto.LineFilterExpression) ([]*logproto.ShortRef, error)
 	Stop()
 }
 
@@ -38,6 +39,29 @@ func NewBloomStore(shipper Interface) (*BloomStore, error) {
 
 func (bs *BloomStore) Stop() {
 	bs.shipper.Stop()
+}
+
+func (bs *BloomStore) Filter(ctx context.Context, tenant string, fp uint64, from, through time.Time, chunks []*logproto.ShortRef, filters ...*logproto.LineFilterExpression) ([]*logproto.ShortRef, error) {
+	fingerprints := make([]uint64, 0, len(chunkRefs))
+	for _, ref := range chunkRefs {
+		fingerprints = append(fingerprints, ref.Fingerprint)
+	}
+
+	blooms, err := bs.queriers(ctx, tenant, from, through, fingerprints)
+	if err != nil {
+		return nil, err
+	}
+
+	searches := convertLineFilterExpressions(filters)
+
+	for _, ref := range chunkRefs {
+		refs, err := blooms.Filter(ctx, model.Fingerprint(ref.Fingerprint), convertToChunkRefs(ref.Refs), searches)
+		if err != nil {
+			return nil, err
+		}
+		ref.Refs = convertToShortRefs(refs)
+	}
+	return chunkRefs, nil
 }
 
 func (bs *BloomStore) FilterChunkRefs(ctx context.Context, tenant string, from, through time.Time, chunkRefs []*logproto.GroupedChunkRefs, filters ...*logproto.LineFilterExpression) ([]*logproto.GroupedChunkRefs, error) {

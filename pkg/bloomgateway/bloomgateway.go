@@ -102,40 +102,6 @@ func newMetrics(subsystem string, registerer prometheus.Registerer) *metrics {
 	}
 }
 
-// Task is the data structure that is enqueued to the internal queue and queued by query workers
-type Task struct {
-	// ID is a lexcographically sortable unique identifier of the task
-	ID ulid.ULID
-	// Tenant is the tenant ID
-	Tenant string
-	// Request is the original request
-	Request *logproto.FilterChunkRefRequest
-	// ErrCh is a send-only channel to write an error to
-	ErrCh chan<- error
-	// ResCh is a send-only channel to write partial responses to
-	ResCh chan<- *logproto.GroupedChunkRefs
-}
-
-// newTask returns a new Task that can be enqueued to the task queue.
-// As additional arguments, it returns a result and an error channel, as well
-// as an error if the instantiation fails.
-func newTask(tenantID string, req *logproto.FilterChunkRefRequest) (Task, chan *logproto.GroupedChunkRefs, chan error, error) {
-	key, err := ulid.New(ulid.Now(), nil)
-	if err != nil {
-		return Task{}, nil, nil, err
-	}
-	errCh := make(chan error, 1)
-	resCh := make(chan *logproto.GroupedChunkRefs, 1)
-	task := Task{
-		ID:      key,
-		Tenant:  tenantID,
-		Request: req,
-		ErrCh:   errCh,
-		ResCh:   resCh,
-	}
-	return task, resCh, errCh, nil
-}
-
 // SyncMap is a map structure which can be synchronized using the RWMutex
 type SyncMap[k comparable, v any] struct {
 	sync.RWMutex
@@ -294,6 +260,10 @@ func (g *Gateway) FilterChunkRefs(ctx context.Context, req *logproto.FilterChunk
 		if ref.Tenant != tenantID {
 			return nil, errors.Wrapf(errInvalidTenant, "expected chunk refs from tenant %s, got tenant %s", tenantID, ref.Tenant)
 		}
+		// Sort ShortRefs by From time in ascending order
+		sort.Slice(ref.Refs, func(i, j int) bool {
+			return ref.Refs[i].From.Before(ref.Refs[j].From)
+		})
 	}
 
 	// Sort ChunkRefs by fingerprint in ascending order
@@ -301,7 +271,7 @@ func (g *Gateway) FilterChunkRefs(ctx context.Context, req *logproto.FilterChunk
 		return req.Refs[i].Fingerprint < req.Refs[j].Fingerprint
 	})
 
-	task, resCh, errCh, err := newTask(tenantID, req)
+	task, resCh, errCh, err := NewTask(tenantID, req)
 	if err != nil {
 		return nil, err
 	}
@@ -370,36 +340,62 @@ func (w *worker) running(_ context.Context) error {
 
 	for {
 		ctx := context.Background()
-		item, newIdx, err := w.queue.Dequeue(ctx, idx, w.ID)
+		items, newIdx, err := w.queue.DequeueMany(ctx, idx, w.ID, 10, 100*time.Millisecond)
 		if err != nil {
-			if err != queue.ErrStopped {
-				level.Error(w.logger).Log("msg", "failed to dequeue task", "err", err)
-				continue
+			// We only return an error if the queue is stopped and dequeuing did not yield any items
+			if err == queue.ErrStopped && len(items) == 0 {
+				return err
 			}
-			return err
+			level.Error(w.logger).Log("msg", "failed to dequeue tasks", "err", err)
 		}
-		task, ok := item.(Task)
-		if !ok {
-			level.Error(w.logger).Log("msg", "failed to cast dequeued item to Task", "item", item)
-			continue
-		}
-		level.Debug(w.logger).Log("msg", "dequeued task", "task", task.ID)
-
-		w.tasks.Delete(task.ID)
-
 		idx = newIdx
 
-		r := task.Request
-		if len(r.Filters) > 0 {
-			r.Refs, err = w.store.FilterChunkRefs(ctx, task.Tenant, r.From.Time(), r.Through.Time(), r.Refs, r.Filters...)
-		}
-		if err != nil {
-			task.ErrCh <- err
-		} else {
-			for _, ref := range r.Refs {
-				task.ResCh <- ref
+		tasksPerDay := make(map[int64][]Task)
+
+		for _, item := range items {
+			task, ok := item.(Task)
+			if !ok {
+				level.Error(w.logger).Log("msg", "failed to cast dequeued item to Task", "item", item)
+				continue
+			}
+			level.Debug(w.logger).Log("msg", "dequeued task", "task", task.ID)
+			w.tasks.Delete(task.ID)
+
+			fromDay := getDay(task.Request.From)
+			throughDay := getDay(task.Request.Through)
+
+			if fromDay == throughDay {
+				tasksPerDay[fromDay] = append(tasksPerDay[fromDay], task)
+			} else {
+				// split task into separate tasks per day
+				for i := fromDay; i < throughDay; i++ {
+					r := filterRequestForDay(task.Request, i)
+					t := task.WithRequest(r)
+					tasksPerDay[i] = append(tasksPerDay[i], t)
+				}
 			}
 		}
+
+		// TODO(chaudum): Process days in parallel
+		for day, tasks := range tasksPerDay {
+			level.Debug(w.logger).Log("msg", "process tasks for day", "day", day, "tasks", len(tasks))
+			iter := newMultiplexIterator(tasks)
+			for iter.Next() {
+				r := iter.At()
+				if len(r.Filters) == 0 {
+					r.ErrCh <- errors.New("no filters")
+					continue
+				}
+				ref, err := w.store.Filter(ctx, r.Tenant, r.Fingerprint, r.From, r.Through, r.Refs, r.Filters...)
+				if err != nil {
+					r.ErrCh <- err
+				} else {
+					r.ResCh <- ref
+				}
+
+			}
+		}
+
 	}
 }
 
