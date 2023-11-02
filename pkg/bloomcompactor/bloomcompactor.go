@@ -27,6 +27,7 @@ package bloomcompactor
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -48,12 +49,17 @@ import (
 	chunk_client "github.com/grafana/loki/pkg/storage/chunk/client"
 	"github.com/grafana/loki/pkg/storage/config"
 	"github.com/grafana/loki/pkg/storage/stores/shipper/bloomshipper"
+	"github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper"
+	shipperindex "github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/index"
 	index_storage "github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/storage"
+	"github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/tsdb"
+	tsdbindex "github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/tsdb/index"
 	"github.com/grafana/loki/pkg/util"
 	util_log "github.com/grafana/loki/pkg/util/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 const (
@@ -77,9 +83,10 @@ const (
 
 // TODO: maybe we don't need all of them
 type storeClient struct {
-	object chunk_client.ObjectClient
-	index  index_storage.Client
-	chunk  chunk_client.Client
+	object       chunk_client.ObjectClient
+	index        index_storage.Client
+	chunk        chunk_client.Client
+	indexShipper indexshipper.IndexShipper
 }
 
 type Compactor struct {
@@ -104,7 +111,6 @@ type Compactor struct {
 	subservicesWatcher *services.FailureWatcher
 
 	sharding ShardingStrategy
-	grouper  Grouper
 }
 
 func New(
@@ -114,7 +120,8 @@ func New(
 	schemaCfg config.SchemaConfig,
 	logger log.Logger,
 	clientMetrics storage.ClientMetrics,
-	r prometheus.Registerer) (*Compactor, error) {
+	r prometheus.Registerer,
+) (*Compactor, error) {
 	c := &Compactor{
 		cfg:       cfg,
 		logger:    logger,
@@ -146,16 +153,38 @@ func New(
 
 	// Create object store clients
 	c.storeClients = make(map[config.DayTime]storeClient)
-	for _, periodicConfig := range schemaCfg.Configs {
+	for i, periodicConfig := range schemaCfg.Configs {
 		objectClient, err := storage.NewObjectClient(periodicConfig.ObjectType, storageCfg, clientMetrics)
 		if err != nil {
 			return nil, fmt.Errorf("error creating object client '%s': %w", periodicConfig.ObjectType, err)
 		}
 
+		periodEndTime := config.DayTime{Time: math.MaxInt64}
+		if i < len(schemaCfg.Configs)-1 {
+			periodEndTime = config.DayTime{Time: schemaCfg.Configs[i+1].From.Time.Add(-time.Millisecond)}
+		}
+		indexShipper, err := indexshipper.NewIndexShipper(
+			periodicConfig.IndexTables.PathPrefix,
+			storageCfg.TSDBShipperConfig.Config,
+			objectClient,
+			nil,
+			nil,
+			func(p string) (shipperindex.Index, error) {
+				return tsdb.OpenShippableTSDB(p, tsdb.IndexOpts{})
+			},
+			periodicConfig.GetIndexTableNumberRange(periodEndTime),
+			prometheus.WrapRegistererWithPrefix("loki_tsdb_shipper_", prometheus.DefaultRegisterer),
+			logger,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "create index shipper")
+		}
+
 		c.storeClients[periodicConfig.From] = storeClient{
-			object: objectClient,
-			index:  index_storage.NewIndexStorageClient(objectClient, periodicConfig.IndexTables.PathPrefix),
-			chunk:  chunk_client.NewClient(objectClient, nil, schemaCfg),
+			object:       objectClient,
+			index:        index_storage.NewIndexStorageClient(objectClient, periodicConfig.IndexTables.PathPrefix),
+			chunk:        chunk_client.NewClient(objectClient, nil, schemaCfg),
+			indexShipper: indexShipper,
 		}
 	}
 
@@ -419,33 +448,37 @@ func (c *Compactor) compactTenant(ctx context.Context, sc storeClient, tableName
 		return err
 	}
 
-	// TODO: Iterate through series to process and create jobs
-	jobs := []Job{
-		{
-			tenantID:  tenant,
-			tableName: tableName,
-			startFP:   0,
-			endFP:     0,
-		},
-	}
-
+	// TODO: Use ForEachConcurrent?
 	errs := multierror.New()
-	if err := concurrency.ForEachJob(ctx, len(jobs), c.cfg.MaxCompactionParallelism, func(ctx context.Context, i int) error {
-		job := jobs[i]
-
-		// Make sure again that the compactor still owns the job.
-		owns, err := c.sharding.OwnsJob(job)
-		if err != nil {
-			errs.Add(errors.Wrap(err, "ownJob"))
-			return nil
-		}
-		if !owns {
-			level.Info(c.logger).Log("msg", "skipped compaction because job is not owned by the compactor instance anymore", "job", job.String())
-			return nil
+	if err := sc.indexShipper.ForEach(ctx, tableName, tenant, func(isMultiTenantIndex bool, idx shipperindex.Index) error {
+		if isMultiTenantIndex {
+			return fmt.Errorf("unexpected multi-tenant")
 		}
 
-		if err := c.runBloomCompact(ctx, sc, job); err != nil {
-			errs.Add(errors.Wrap(err, "runBloomCompact"))
+		// TODO: Make these casts safely
+		if err := idx.(*tsdb.TSDBFile).Index.(*tsdb.TSDBIndex).ForSeries(
+			ctx, nil,
+			0, math.MaxInt64, // TODO: Replace with MaxLookBackPeriod
+			func(labels labels.Labels, fingerprint model.Fingerprint, chksMetas []tsdbindex.ChunkMeta) {
+				job := NewJob(tenant, tableName, fingerprint, chksMetas)
+
+				ownsJob, err := c.sharding.OwnsJob(job)
+				if err != nil {
+					level.Error(c.logger).Log("msg", "failed to check if compactor owns job", "job", job, "err", err)
+					errs.Add(err)
+					return
+				}
+				if !ownsJob {
+					level.Debug(c.logger).Log("msg", "skipping job because it is not owned by this shard", "job", job)
+					return
+				}
+
+				if err := c.runBloomCompact(ctx, sc, job); err != nil {
+					errs.Add(errors.Wrap(err, "runBloomCompact"))
+				}
+			},
+		); err != nil {
+			errs.Add(err)
 		}
 
 		return nil
@@ -492,20 +525,6 @@ func (c *Compactor) compactTenantWithRetries(ctx context.Context, sc storeClient
 			return c.compactTenant(ctx, sc, tableName, tenant)
 		},
 	)
-}
-
-func (c *Compactor) filterOwnJobs(jobs []Job) ([]Job, error) {
-	for ix := 0; ix < len(jobs); {
-		// Skip any job which doesn't belong to this compactor instance.
-		if ok, err := c.sharding.OwnsJob(jobs[ix]); err != nil {
-			return nil, errors.Wrap(err, "ownJob")
-		} else if !ok {
-			jobs = append(jobs[:ix], jobs[ix+1:]...)
-		} else {
-			ix++
-		}
-	}
-	return jobs, nil
 }
 
 func (c *Compactor) OnRingInstanceRegister(_ *ring.BasicLifecycler, ringDesc ring.Desc, instanceExists bool, _ string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {

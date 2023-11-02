@@ -1,6 +1,7 @@
 package bloomcompactor
 
 import (
+	"github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/tsdb/index"
 	"github.com/prometheus/common/model"
 )
 
@@ -8,33 +9,34 @@ import (
 // Not goroutine safe.
 // TODO: A job should probably contain series or chunks
 type Job struct {
-	tenantID       string
-	tableName      string
-	startFP, endFP model.Fingerprint
+	tenantID  string
+	tableName string
+	seriesFP  model.Fingerprint
+	chunks    []index.ChunkMeta
 }
 
 // NewJob returns a new compaction Job.
-func NewJob(tenantID string, tableName string, startFP, endFP model.Fingerprint) *Job {
-	return &Job{
+func NewJob(tenantID string, tableName string, seriesFP model.Fingerprint, chunks []index.ChunkMeta) Job {
+	return Job{
 		tenantID:  tenantID,
 		tableName: tableName,
-		startFP:   startFP,
-		endFP:     endFP,
+		seriesFP:  seriesFP,
+		chunks:    chunks,
 	}
 }
 
 func (j Job) String() string {
-	return j.tableName + "_" + j.tenantID + "_" + j.startFP.String() + "_" + j.endFP.String()
+	return j.tableName + "_" + j.tenantID + "_" + j.seriesFP.String()
 }
 
 func (j Job) Tenant() string {
 	return j.tenantID
 }
 
-func (j Job) StartFP() model.Fingerprint {
-	return j.startFP
+func (j Job) Fingerprint() model.Fingerprint {
+	return j.seriesFP
 }
 
-func (j Job) EndFP() model.Fingerprint {
-	return j.endFP
+func (j Job) Chunks() []index.ChunkMeta {
+	return j.chunks
 }

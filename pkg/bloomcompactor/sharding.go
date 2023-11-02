@@ -19,14 +19,21 @@ type ShuffleShardingStrategy struct {
 	ring           *ring.Ring
 	ringLifecycler *ring.BasicLifecycler
 	limits         Limits
+
+	// Buffers to avoid allocations in ring.Get
+	bufDescs           []ring.InstanceDesc
+	bufHosts, bufZones []string
 }
 
-func NewShuffleShardingStrategy(ring *ring.Ring, ringLifecycler *ring.BasicLifecycler, limits Limits) *ShuffleShardingStrategy {
-	return &ShuffleShardingStrategy{
-		ring:           ring,
+func NewShuffleShardingStrategy(r *ring.Ring, ringLifecycler *ring.BasicLifecycler, limits Limits) *ShuffleShardingStrategy {
+	s := ShuffleShardingStrategy{
+		ring:           r,
 		ringLifecycler: ringLifecycler,
 		limits:         limits,
 	}
+	s.bufDescs, s.bufHosts, s.bufZones = ring.MakeBuffersForGet()
+
+	return &s
 }
 
 // getShuffleShardingSubring returns the subring to be used for a given user.
@@ -57,19 +64,7 @@ func (s *ShuffleShardingStrategy) OwnsJob(job Job) (bool, error) {
 		return false, nil
 	}
 
-	bufDescs, bufHosts, bufZones := ring.MakeBuffersForGet()
-
-	// If the lower end of the job FP range is owned by this compactor, we own the job.
-	rs, err := subRing.Get(uint32(job.StartFP()), RingOp, bufDescs, bufHosts, bufZones)
-	if err != nil {
-		return false, err
-	}
-	if rs.Includes(s.ringLifecycler.GetInstanceID()) {
-		return true, nil
-	}
-
-	// If the upper end of the job FP range is owned by this compactor, we own the job.
-	rs, err = subRing.Get(uint32(job.EndFP()), RingOp, bufDescs, bufHosts, bufZones)
+	rs, err := subRing.Get(uint32(job.Fingerprint()), RingOp, s.bufDescs, s.bufHosts, s.bufZones)
 	if err != nil {
 		return false, err
 	}
