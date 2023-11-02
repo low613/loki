@@ -45,6 +45,7 @@ import (
 	"github.com/grafana/loki/pkg/storage"
 	v1 "github.com/grafana/loki/pkg/storage/bloom/v1"
 	"github.com/grafana/loki/pkg/storage/bloom/v1/filter"
+	chunk_client "github.com/grafana/loki/pkg/storage/chunk/client"
 	"github.com/grafana/loki/pkg/storage/config"
 	"github.com/grafana/loki/pkg/storage/stores/shipper/bloomshipper"
 	index_storage "github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/storage"
@@ -74,6 +75,13 @@ const (
 	ringNumTokens = 1
 )
 
+// TODO: maybe we don't need all of them
+type storeClient struct {
+	object chunk_client.ObjectClient
+	index  index_storage.Client
+	chunk  chunk_client.Client
+}
+
 type Compactor struct {
 	services.Service
 
@@ -89,17 +97,19 @@ type Compactor struct {
 	bloomStore         bloomshipper.Store
 
 	// Client used to run operations on the bucket storing bloom blocks.
-	storeClients map[config.DayTime]index_storage.Client
+	storeClients map[config.DayTime]storeClient
 
 	// Subservices manager.
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
-	shardingStrategy shardingStrategy
+	sharding ShardingStrategy
+	grouper  Grouper
 }
 
 func New(
 	cfg Config,
+	limits Limits,
 	storageCfg storage.Config,
 	schemaCfg config.SchemaConfig,
 	logger log.Logger,
@@ -135,13 +145,18 @@ func New(
 	c.bloomStore = store
 
 	// Create object store clients
-	c.storeClients = make(map[config.DayTime]index_storage.Client)
+	c.storeClients = make(map[config.DayTime]storeClient)
 	for _, periodicConfig := range schemaCfg.Configs {
 		objectClient, err := storage.NewObjectClient(periodicConfig.ObjectType, storageCfg, clientMetrics)
 		if err != nil {
 			return nil, fmt.Errorf("error creating object client '%s': %w", periodicConfig.ObjectType, err)
 		}
-		c.storeClients[periodicConfig.From] = index_storage.NewIndexStorageClient(objectClient, periodicConfig.IndexTables.PathPrefix)
+
+		c.storeClients[periodicConfig.From] = storeClient{
+			object: objectClient,
+			index:  index_storage.NewIndexStorageClient(objectClient, periodicConfig.IndexTables.PathPrefix),
+			chunk:  chunk_client.NewClient(objectClient, nil, schemaCfg),
+		}
 	}
 
 	ringStore, err := kv.NewClient(
@@ -183,6 +198,10 @@ func New(
 	}
 	c.subservicesWatcher = services.NewFailureWatcher()
 	c.subservicesWatcher.WatchManager(c.subservices)
+
+	// Create sharding strategy
+	c.sharding = NewShuffleShardingStrategy(c.ring, c.ringLifecycler, limits)
+	// TODO: Create grouper
 
 	c.Service = services.NewBasicService(c.starting, c.running, c.stopping)
 
@@ -269,8 +288,8 @@ func (c *Compactor) runCompaction(ctx context.Context) error {
 	)
 	for _, sc := range c.storeClients {
 		// refresh index list cache since previous compaction would have changed the index files in the object store
-		sc.RefreshIndexTableNamesCache(ctx)
-		tbls, err := sc.ListTables(ctx)
+		sc.index.RefreshIndexTableNamesCache(ctx)
+		tbls, err := sc.index.ListTables(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to list tables: %w", err)
 		}
@@ -321,22 +340,22 @@ func (c *Compactor) compactTable(ctx context.Context, tableName string) error {
 		return nil
 	}
 
-	storeClient, ok := c.storeClients[schemaCfg.From]
+	sc, ok := c.storeClients[schemaCfg.From]
 	if !ok {
 		return fmt.Errorf("index store client not found for period starting at %s", schemaCfg.From.String())
 	}
 
-	_, tenants, err := storeClient.ListFiles(ctx, tableName, false)
+	_, tenants, err := sc.index.ListFiles(ctx, tableName, false)
 	if err != nil {
 		return fmt.Errorf("failed to list files for table %s: %w", tableName, err)
 	}
 
 	level.Info(c.logger).Log("msg", "discovered tenants from bucket", "users", len(tenants))
-	return c.compactUsers(ctx, tenants)
+	return c.compactUsers(ctx, sc, tableName, tenants)
 }
 
 // See: https://github.com/grafana/mimir/blob/34852137c332d4050e53128481f4f6417daee91e/pkg/compactor/compactor.go#L566-L689
-func (c *Compactor) compactUsers(ctx context.Context, tenants []string) error {
+func (c *Compactor) compactUsers(ctx context.Context, sc storeClient, tableName string, tenants []string) error {
 	// When starting multiple compactor replicas nearly at the same time, running in a cluster with
 	// a large number of tenants, we may end up in a situation where the 1st user is compacted by
 	// multiple replicas at the same time. Shuffling users helps reduce the likelihood this will happen.
@@ -354,7 +373,7 @@ func (c *Compactor) compactUsers(ctx context.Context, tenants []string) error {
 		}
 
 		// Ensure the tenant ID belongs to our shard.
-		owned, err := c.shardingStrategy.ownTenant(tenant)
+		owned, err := c.sharding.OwnsTenant(tenant)
 		if err != nil {
 			// c.compactionRunSkippedTenants.Inc()
 			level.Warn(c.logger).Log("msg", "unable to check if tenant is owned by this shard", "tenantID", tenant, "err", err)
@@ -368,7 +387,7 @@ func (c *Compactor) compactUsers(ctx context.Context, tenants []string) error {
 
 		ownedTenants[tenant] = struct{}{}
 
-		if err := c.compactTenantWithRetries(ctx, tenant); err != nil {
+		if err := c.compactTenantWithRetries(ctx, sc, tableName, tenant); err != nil {
 			switch {
 			case errors.Is(err, context.Canceled):
 				// We don't want to count shutdowns as failed compactions because we will pick up with the rest of the compaction after the restart.
@@ -389,12 +408,10 @@ func (c *Compactor) compactUsers(ctx context.Context, tenants []string) error {
 
 	return errs.Err()
 
-	// TODO: Delete local files for unowned tenants, if there are any. This cleans up
-	// leftover local files for tenants that belong to different compactors now,
-	// or have been deleted completely.
+	// TODO: Delete local files for unowned tenants, if there are any.
 }
 
-func (c *Compactor) compactTenant(ctx context.Context, tenant string) error {
+func (c *Compactor) compactTenant(ctx context.Context, sc storeClient, tableName string, tenant string) error {
 	level.Info(c.logger).Log("msg", "starting compaction of tenant", "tenant", tenant)
 
 	// Ensure the context has not been canceled (ie. compactor shutdown has been triggered).
@@ -402,34 +419,32 @@ func (c *Compactor) compactTenant(ctx context.Context, tenant string) error {
 		return err
 	}
 
-	// TODO: Create jobs
-	jobs := []Job{}
-
-	// There is another check just before we start processing the job, but we can avoid sending it
-	// to the goroutine in the first place.
-	jobs, err := c.filterOwnJobs(jobs)
-	if err != nil {
-		return err
+	// TODO: Iterate through series to process and create jobs
+	jobs := []Job{
+		{
+			tenantID:  tenant,
+			tableName: tableName,
+			startFP:   0,
+			endFP:     0,
+		},
 	}
 
-	// TODO: Sort jobs?
-
 	errs := multierror.New()
-	if err = concurrency.ForEachJob(ctx, len(jobs), c.cfg.MaxCompactionParallelism, func(ctx context.Context, i int) error {
+	if err := concurrency.ForEachJob(ctx, len(jobs), c.cfg.MaxCompactionParallelism, func(ctx context.Context, i int) error {
 		job := jobs[i]
 
 		// Make sure again that the compactor still owns the job.
-		owns, err := c.shardingStrategy.ownJob(job)
+		owns, err := c.sharding.OwnsJob(job)
 		if err != nil {
 			errs.Add(errors.Wrap(err, "ownJob"))
 			return nil
 		}
 		if !owns {
-			level.Info(c.logger).Log("msg", "skipped compaction because job is not owned by the compactor instance anymore", "job", job.Key())
+			level.Info(c.logger).Log("msg", "skipped compaction because job is not owned by the compactor instance anymore", "job", job.String())
 			return nil
 		}
 
-		if err := c.runBloomCompact(ctx, job); err != nil {
+		if err := c.runBloomCompact(ctx, sc, job); err != nil {
 			errs.Add(errors.Wrap(err, "runBloomCompact"))
 		}
 
@@ -467,14 +482,14 @@ func runWithRetries(
 	return lastErr
 }
 
-func (c *Compactor) compactTenantWithRetries(ctx context.Context, tenant string) error {
+func (c *Compactor) compactTenantWithRetries(ctx context.Context, sc storeClient, tableName string, tenant string) error {
 	return runWithRetries(
 		ctx,
 		c.cfg.retryMinBackoff,
 		c.cfg.retryMaxBackoff,
 		c.cfg.CompactionRetries,
 		func(ctx context.Context) error {
-			return c.compactTenant(ctx, tenant)
+			return c.compactTenant(ctx, sc, tableName, tenant)
 		},
 	)
 }
@@ -482,7 +497,7 @@ func (c *Compactor) compactTenantWithRetries(ctx context.Context, tenant string)
 func (c *Compactor) filterOwnJobs(jobs []Job) ([]Job, error) {
 	for ix := 0; ix < len(jobs); {
 		// Skip any job which doesn't belong to this compactor instance.
-		if ok, err := c.shardingStrategy.ownJob(jobs[ix]); err != nil {
+		if ok, err := c.sharding.OwnsJob(jobs[ix]); err != nil {
 			return nil, errors.Wrap(err, "ownJob")
 		} else if !ok {
 			jobs = append(jobs[:ix], jobs[ix+1:]...)
@@ -600,7 +615,7 @@ func (c *Compactor) compactNewChunks(ctx context.Context, dst string) (err error
 	return nil
 }
 
-func (c *Compactor) runBloomCompact(ctx context.Context, job Job) error {
+func (c *Compactor) runBloomCompact(ctx context.Context, sc storeClient, job Job) error {
 	// TODO set MaxLookBackPeriod to Max ingester accepts
 	maxLookBackPeriod := c.cfg.MaxLookBackPeriod
 
@@ -608,9 +623,9 @@ func (c *Compactor) runBloomCompact(ctx context.Context, job Job) error {
 	start := end - maxLookBackPeriod.Milliseconds()
 
 	metaSearchParams := bloomshipper.MetaSearchParams{
-		TenantID:       job.tenantID,
-		MinFingerprint: job.startFP,
-		MaxFingerprint: job.endFP,
+		TenantID:       job.Tenant(),
+		MinFingerprint: uint64(job.StartFP()),
+		MaxFingerprint: uint64(job.EndFP()),
 		StartTimestamp: start,
 		EndTimestamp:   end,
 	}

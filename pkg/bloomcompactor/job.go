@@ -1,8 +1,6 @@
 package bloomcompactor
 
 import (
-	"fmt"
-
 	"github.com/prometheus/common/model"
 )
 
@@ -10,22 +8,33 @@ import (
 // Not goroutine safe.
 // TODO: A job should probably contain series or chunks
 type Job struct {
-	tenantID    string
-	startFP     model.Fingerprint
-	endFP       model.Fingerprint
-	shardingKey string
+	tenantID       string
+	tableName      string
+	startFP, endFP model.Fingerprint
 }
 
 // NewJob returns a new compaction Job.
-func NewJob(tenantID string, startFP, endFP model.Fingerprint) *Job {
+func NewJob(tenantID string, tableName string, startFP, endFP model.Fingerprint) *Job {
 	return &Job{
-		tenantID:    tenantID,
-		startFP:     startFP,
-		endFP:       endFP,
-		shardingKey: fmt.Sprintf("%s-%s-%s", tenantID, startFP.String(), endFP.String()),
+		tenantID:  tenantID,
+		tableName: tableName,
+		startFP:   startFP,
+		endFP:     endFP,
 	}
 }
 
-func (j Job) Key() string {
-	return j.shardingKey
+func (j Job) String() string {
+	return j.tableName + "_" + j.tenantID + "_" + j.startFP.String() + "_" + j.endFP.String()
+}
+
+func (j Job) Tenant() string {
+	return j.tenantID
+}
+
+func (j Job) StartFP() model.Fingerprint {
+	return j.startFP
+}
+
+func (j Job) EndFP() model.Fingerprint {
+	return j.endFP
 }

@@ -1380,6 +1380,7 @@ func (t *Loki) initBloomCompactor() (services.Service, error) {
 	logger := log.With(util_log.Logger, "component", "bloom-compactor")
 	compactor, err := bloomcompactor.New(
 		t.Cfg.BloomCompactor,
+		t.Overrides,
 		t.Cfg.StorageConfig,
 		t.Cfg.SchemaConfig,
 		logger,

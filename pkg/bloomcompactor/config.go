@@ -35,3 +35,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.Ring.RegisterFlagsWithPrefix("bloom-compactor.", "collectors/", f)
 	f.BoolVar(&cfg.Enabled, "bloom-compactor.enabled", false, "Flag to enable or disable the usage of the bloom-compactor component.")
 }
+
+type Limits interface {
+	BloomCompactorShardSize(tenantID string) int
+}
